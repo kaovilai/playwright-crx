@@ -18,7 +18,9 @@ import type { RecorderEventData, RecorderMessage, RecorderWindow } from './crxRe
 
 export class SidepanelRecorderWindow implements RecorderWindow {
   private _recorderUrl: string;
-  private _portPromise: Promise<chrome.runtime.Port>;
+  private _port?: chrome.runtime.Port;
+  private _portPromise?: Promise<chrome.runtime.Port>;
+  private _connectListener?: (port: chrome.runtime.Port) => void;
   private _closed = true;
   onMessage?: (({ type, event, params }: RecorderEventData) => void) | undefined;
   hideApp?: (() => any) | undefined;
@@ -33,13 +35,14 @@ export class SidepanelRecorderWindow implements RecorderWindow {
   }
 
   postMessage(msg: RecorderMessage) {
-    this._portPromise.then(port => port.postMessage({ ...msg })).catch(() => {});
+    this._portPromise?.then(port => port.postMessage({ ...msg })).catch(() => {});
   }
 
   async open() {
-    await chrome.sidePanel.setOptions({ path: this._recorderUrl });
-    await this._portPromise;
     this._closed = false;
+    await chrome.sidePanel.setOptions({ path: this._recorderUrl });
+    this._portPromise = this._portPromise ?? this._waitConnect();
+    await this._portPromise;
   }
 
   async focus() {
@@ -49,21 +52,48 @@ export class SidepanelRecorderWindow implements RecorderWindow {
     if (this._closed)
       return;
     this._closed = true;
-    this._portPromise.then(port => port.disconnect());
-    this._portPromise = this._waitConnect();
-    this.hideApp?.();
+    this._cleanupPort(true);
+    this._portPromise = undefined;
+    if (this._connectListener) {
+      chrome.runtime.onConnect.removeListener(this._connectListener);
+      this._connectListener = undefined;
+    }
   }
 
   private _waitConnect(): Promise<chrome.runtime.Port> {
     return new Promise(resolve => {
-      const onConnect = (port: chrome.runtime.Port) => {
-        chrome.runtime.onConnect.removeListener(onConnect);
-        port.onDisconnect.addListener(this.close.bind(this));
+      this._connectListener = (port: chrome.runtime.Port) => {
+        chrome.runtime.onConnect.removeListener(this._connectListener!);
+        this._connectListener = undefined;
+        this._bindPort(port);
         if (this.onMessage)
-          port.onMessage.addListener(this.onMessage.bind(this));
+          port.onMessage.addListener(this.onMessage);
         resolve(port);
       };
-      chrome.runtime.onConnect.addListener(onConnect);
+      chrome.runtime.onConnect.addListener(this._connectListener);
     });
   }
+
+  private _bindPort(port: chrome.runtime.Port) {
+    this._cleanupPort(false);
+    this._port = port;
+    port.onDisconnect.addListener(this._onDisconnect);
+  }
+
+  private _cleanupPort(disconnect: boolean) {
+    if (!this._port)
+      return;
+    this._port.onDisconnect.removeListener(this._onDisconnect);
+    if (this.onMessage)
+      this._port.onMessage.removeListener(this.onMessage);
+    if (disconnect)
+      this._port.disconnect();
+    this._port = undefined;
+  }
+
+  private _onDisconnect = () => {
+    this._cleanupPort(false);
+    if (!this._closed)
+      this._portPromise = this._waitConnect();
+  };
 }

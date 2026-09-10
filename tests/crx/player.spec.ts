@@ -89,7 +89,7 @@ test('should clear errors when resuming after errors', async ({ basePath, page, 
   await expect(recorderPage.locator('.CodeMirror-line:has(.source-line-error-underline)')).toHaveCount(0);
 });
 
-test('should step', async ({ recorderPage, baseURL }) => {
+test('should step', async ({ page, recorderPage, baseURL }) => {
 
   await recorderPage.getByTitle('Record').click();
 
@@ -106,13 +106,19 @@ test('should step', async ({ recorderPage, baseURL }) => {
     `▼ Click( page.locator('textarea') ) ⏸️`,
   ]);
 
+  let steppedNavigation = false;
+  const navigationPromise = page.waitForNavigation({ timeout: 1000 })
+      .then(() => steppedNavigation = true)
+      .catch(() => {});
   await recorderPage.getByTitle('Step Over (F10)').click();
+  await navigationPromise;
   await expect(recorderPage.locator('.source-line-paused .CodeMirror-line')).toHaveText(`  await page.locator('textarea').fill('test');`);
   await expect.poll(dumpLogHeaders(recorderPage)).toEqual([
     `► Navigate to "/input/textarea.html"( ${baseURL}/input/textarea.html ) ✅ — XXms`,
     `► Click( page.locator('textarea') ) ✅ — XXms`,
     `▼ Fill "test"( page.locator('textarea') ) ⏸️`,
   ]);
+  expect(steppedNavigation).toBe(false);
 
   await recorderPage.getByTitle('Step Over (F10)').click();
   await expect.poll(dumpLogHeaders(recorderPage)).toEqual([
@@ -122,7 +128,7 @@ test('should step', async ({ recorderPage, baseURL }) => {
   ]);
 });
 
-test('should step then resume', async ({ recorderPage, baseURL }) => {
+test('should step then resume', async ({ page, recorderPage, baseURL }) => {
   await recorderPage.getByTitle('Record').click();
 
   await recorderPage.getByTitle('Step Over (F10)').click();
@@ -130,12 +136,24 @@ test('should step then resume', async ({ recorderPage, baseURL }) => {
     `▼ Navigate to "/input/textarea.html"( ${baseURL}/input/textarea.html ) ⏸️`,
   ]);
 
+  await recorderPage.getByTitle('Step Over (F10)').click();
+  await expect.poll(dumpLogHeaders(recorderPage)).toEqual([
+    `► Navigate to "/input/textarea.html"( ${baseURL}/input/textarea.html ) ✅ — XXms`,
+    `▼ Click( page.locator('textarea') ) ⏸️`,
+  ]);
+
+  let resumedNavigation = false;
+  const navigationPromise = page.waitForNavigation({ timeout: 1000 })
+      .then(() => resumedNavigation = true)
+      .catch(() => {});
   await recorderPage.getByTitle('Resume (F8)').click();
+  await navigationPromise;
   await expect.poll(dumpLogHeaders(recorderPage)).toEqual([
     `► Navigate to "/input/textarea.html"( ${baseURL}/input/textarea.html ) ✅ — XXms`,
     `► Click( page.locator('textarea') ) ✅ — XXms`,
     `► Fill "test"( page.locator('textarea') ) ✅ — XXms`,
   ]);
+  expect(resumedNavigation).toBe(false);
 });
 
 test('should resume then step', async ({ recorderPage, baseURL }) => {
