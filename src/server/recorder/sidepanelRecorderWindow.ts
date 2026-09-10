@@ -15,19 +15,30 @@
  */
 
 import type { RecorderEventData, RecorderMessage, RecorderWindow } from './crxRecorderApp';
+import type { RuntimePortLifecycleRetryOptions } from './runtimePortLifecycle';
+import { RuntimePortLifecycle } from './runtimePortLifecycle';
 
 export class SidepanelRecorderWindow implements RecorderWindow {
   private _recorderUrl: string;
-  private _port?: chrome.runtime.Port;
-  private _portPromise?: Promise<chrome.runtime.Port>;
-  private _connectListener?: (port: chrome.runtime.Port) => void;
+  private _connection: RuntimePortLifecycle<RecorderMessage>;
   private _closed = true;
   onMessage?: (({ type, event, params }: RecorderEventData) => void) | undefined;
+  onConnected?: (() => void) | undefined;
   hideApp?: (() => any) | undefined;
 
-  constructor(recorderUrl?: string) {
+  constructor(recorderUrl?: string, connectionOptions?: RuntimePortLifecycleRetryOptions) {
     this._recorderUrl = recorderUrl ?? 'index.html';
-    this._portPromise = this._waitConnect();
+    this._connection = new RuntimePortLifecycle<RecorderMessage>({
+      name: 'sidepanel recorder connection',
+      canReconnect: () => !this._closed,
+      getMessageListener: () => this.onMessage,
+      onConnected: () => this.onConnected?.(),
+      onConnectionExhausted: () => {
+        if (!this._closed)
+          this.close().then(() => this.hideApp?.()).catch(() => {});
+      },
+      ...connectionOptions
+    });
   }
 
   isClosed(): boolean {
@@ -35,14 +46,15 @@ export class SidepanelRecorderWindow implements RecorderWindow {
   }
 
   postMessage(msg: RecorderMessage) {
-    this._portPromise?.then(port => port.postMessage({ ...msg })).catch(() => {});
+    this._connection.postMessage(msg);
   }
 
   async open() {
     this._closed = false;
-    await chrome.sidePanel.setOptions({ path: this._recorderUrl });
-    this._portPromise = this._portPromise ?? this._waitConnect();
-    await this._portPromise;
+    await Promise.all([
+      chrome.sidePanel.setOptions({ path: this._recorderUrl }),
+      this._connection.open(),
+    ]);
   }
 
   async focus() {
@@ -52,48 +64,6 @@ export class SidepanelRecorderWindow implements RecorderWindow {
     if (this._closed)
       return;
     this._closed = true;
-    this._cleanupPort(true);
-    this._portPromise = undefined;
-    if (this._connectListener) {
-      chrome.runtime.onConnect.removeListener(this._connectListener);
-      this._connectListener = undefined;
-    }
+    await this._connection.close({ disconnect: true });
   }
-
-  private _waitConnect(): Promise<chrome.runtime.Port> {
-    return new Promise(resolve => {
-      this._connectListener = (port: chrome.runtime.Port) => {
-        chrome.runtime.onConnect.removeListener(this._connectListener!);
-        this._connectListener = undefined;
-        this._bindPort(port);
-        if (this.onMessage)
-          port.onMessage.addListener(this.onMessage);
-        resolve(port);
-      };
-      chrome.runtime.onConnect.addListener(this._connectListener);
-    });
-  }
-
-  private _bindPort(port: chrome.runtime.Port) {
-    this._cleanupPort(false);
-    this._port = port;
-    port.onDisconnect.addListener(this._onDisconnect);
-  }
-
-  private _cleanupPort(disconnect: boolean) {
-    if (!this._port)
-      return;
-    this._port.onDisconnect.removeListener(this._onDisconnect);
-    if (this.onMessage)
-      this._port.onMessage.removeListener(this.onMessage);
-    if (disconnect)
-      this._port.disconnect();
-    this._port = undefined;
-  }
-
-  private _onDisconnect = () => {
-    this._cleanupPort(false);
-    if (!this._closed)
-      this._portPromise = this._waitConnect();
-  };
 }

@@ -48,6 +48,7 @@ export interface RecorderWindow {
   focus: () => Promise<void>;
   close: () => Promise<void>;
   onMessage?: ({ type, event, params }: RecorderEventData) => void;
+  onConnected?: () => void;
   hideApp?: () => any;
 }
 
@@ -86,6 +87,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
 
     this._window = options?.window?.type === 'sidepanel' ? new SidepanelRecorderWindow(options.window.url) : new PopupRecorderWindow(options?.window?.url);
     this._window.onMessage = this._onMessage.bind(this);
+    this._window.onConnected = this._syncWindowState.bind(this);
     this._window.hideApp  = this._hide.bind(this);
 
     // set in recorder before, so that if it opens the recorder UI window, it will already reflect the changes
@@ -257,6 +259,20 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
 
   _sendMessage(msg: RecorderMessage) {
     return this._window?.postMessage(msg);
+  }
+
+  private _syncWindowState() {
+    this._sendMessage({ type: 'recorder', method: 'setMode', mode: this._mode });
+    this._sendMessage({ type: 'recorder', method: 'resetCallLogs' });
+    const callLogs = [...this._callLogs.values()];
+    if (callLogs.length)
+      this._sendMessage({ type: 'recorder', method: 'updateCallLogs', callLogs });
+    if (this._sources) {
+      const sources = this._sources
+          .filter(s => s.isRecorded)
+          .map(s => this._editedCode?.decorate(s) ?? s);
+      this._sendMessage({ type: 'recorder', method: 'setSources', sources });
+    }
   }
 
   async uninstall(page: Page) {

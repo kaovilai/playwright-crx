@@ -14,12 +14,19 @@
  * limitations under the License.
  */
 
-import type { LogName } from 'playwright-core/lib/server/utils/debugLogger';
-import { debugLogger } from 'playwright-core/lib/server/utils/debugLogger';
 import type { Protocol } from 'playwright-core/lib/server/chromium/protocol';
 import type { Progress } from 'playwright-core/lib/server/progress';
 import type { ConnectionTransport, ProtocolRequest, ProtocolResponse } from 'playwright-core/lib/server/transport';
 import { createTab } from '../utils';
+
+type LogName = string;
+const debugLogger = (() => {
+  try {
+    return require('playwright-core/lib/server/utils/debugLogger').debugLogger;
+  } catch {
+    return { isEnabled: () => false, log: () => {} };
+  }
+})();
 
 type Tab = chrome.tabs.Tab;
 
@@ -29,10 +36,14 @@ type DebuggerSession = chrome.debugger.Debuggee & { sessionId?: string };
 
 export class CrxTransport implements ConnectionTransport {
   private _progress?: Progress;
-  private _detachedPromise?: Promise<void>;
+  private _closePromise?: Promise<void>;
+  private _closing = false;
   private _targetToTab: Map<string, number>;
   private _tabToTarget: Map<number, Protocol.Target.TargetInfo>;
   private _sessions: Map<string, number>;
+  private _attachPromises: Map<number, Promise<Protocol.Target.TargetInfo>>;
+  private _detachPromises: Map<number, Promise<void>>;
+  private _reconnectPromises: Map<number, Promise<void>>;
   private _defaultBrowserContextId?: string;
 
   onmessage?: (message: ProtocolResponse) => void;
@@ -43,9 +54,12 @@ export class CrxTransport implements ConnectionTransport {
     this._tabToTarget = new Map();
     this._targetToTab = new Map();
     this._sessions = new Map();
+    this._attachPromises = new Map();
+    this._detachPromises = new Map();
+    this._reconnectPromises = new Map();
     chrome.debugger.onEvent.addListener(this._onDebuggerEvent);
-    chrome.debugger.onDetach.addListener(this._onRemoved);
-    chrome.tabs.onRemoved.addListener(this._onRemoved);
+    chrome.debugger.onDetach.addListener(this._onDebuggerDetach);
+    chrome.tabs.onRemoved.addListener(this._onTabRemoved);
     chrome.tabs.onCreated.addListener(this._onPopupCreated);
   }
 
@@ -67,16 +81,9 @@ export class CrxTransport implements ConnectionTransport {
 
   async send(message: ProtocolRequest) {
     try {
-      const [, tabIdStr] = /crx-tab-(\d+)/.exec(message.sessionId ?? '') ?? [];
-      let debuggee: DebuggerSession;
-      if (tabIdStr) {
-        const tabId = parseInt(tabIdStr, 10);
-        debuggee = { tabId };
-      } else {
-        const sessionId = message.sessionId!;
-        const tabId = this._sessions.get(sessionId)!;
-        debuggee = { tabId, sessionId };
-      }
+      if (this._closing)
+        throw new Error('Connection is closing');
+      const { tabId, debuggee } = await this._resolveDebuggee(message);
 
       let result;
       // chrome extensions doesn't support all CDP commands so we need to handle them
@@ -151,7 +158,7 @@ export class CrxTransport implements ConnectionTransport {
         await Promise.all(debuggees.map(debuggee => this._send(debuggee, 'Network.setCookies', params)));
         result = {};
       } else {
-        result = await this._send(debuggee, message.method as keyof Protocol.CommandParameters, { ...message.params });
+        result = await this._sendWithRecovery(tabId, debuggee, message.method as keyof Protocol.CommandParameters, { ...message.params });
       }
 
       this._emitMessage({
@@ -167,13 +174,20 @@ export class CrxTransport implements ConnectionTransport {
   }
 
   async attach(tabId: number, onBeforeEmitAttachedToTarget?: (targetInfo: Protocol.Target.TargetInfo) => any) {
+    if (this._closing)
+      throw new Error('Connection is closing');
     let targetInfo = this._tabToTarget.get(tabId);
 
-    if (!targetInfo) {
+    if (targetInfo)
+      return targetInfo;
+    const pending = this._attachPromises.get(tabId);
+    if (pending)
+      return await pending;
+
+    const promise = (async () => {
       const debuggee = { tabId };
       await chrome.debugger.attach(debuggee, '1.3');
       this._progress?.log(`<chrome debugger attached to tab ${tabId}>`);
-      // we don't create a new browser context, just return the current one
       const response = await this._send(debuggee, 'Target.getTargetInfo');
       targetInfo = response.targetInfo;
 
@@ -185,47 +199,51 @@ export class CrxTransport implements ConnectionTransport {
 
       await onBeforeEmitAttachedToTarget?.(targetInfo!);
 
-      // force browser to create a page
       this._emitAttachedToTarget(tabId, targetInfo);
 
       this._tabToTarget.set(tabId, targetInfo);
       this._targetToTab.set(targetInfo.targetId, tabId);
-    }
-
-    return targetInfo;
+      return targetInfo;
+    })().finally(() => this._attachPromises.delete(tabId));
+    this._attachPromises.set(tabId, promise);
+    return await promise;
   }
 
   async detach(tabOrTarget: number | string) {
     const tabId = typeof tabOrTarget === 'number' ? tabOrTarget : this._targetToTab.get(tabOrTarget);
     if (!tabId)
       return;
+    const pending = this._detachPromises.get(tabId);
+    if (pending)
+      return await pending;
 
-    const targetInfo = this._tabToTarget.get(tabId);
-    this._tabToTarget.delete(tabId);
-    if (targetInfo) {
-      this._targetToTab.delete(targetInfo.targetId);
-      this._emitDetachedToTarget(tabId, targetInfo.targetId);
-    }
-    await chrome.debugger.detach({ tabId }).catch(() => {});
-    this._progress?.log(`<chrome debugger detached from tab ${tabId}>`);
+    const promise = (async () => {
+      this._dropTabMappings(tabId, true);
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+      this._progress?.log(`<chrome debugger detached from tab ${tabId}>`);
+    })().finally(() => this._detachPromises.delete(tabId));
+    this._detachPromises.set(tabId, promise);
+    return await promise;
   }
 
   close() {
-    if (this._detachedPromise)
+    if (this._closePromise)
       return;
-    this._detachedPromise = Promise.all([...this._tabToTarget.keys()]
-        .map(this.detach))
+    this._closing = true;
+    this._closePromise = Promise.all([...this._tabToTarget.keys()]
+        .map(tabId => this.detach(tabId)))
         .then(() => this.onclose?.());
   }
 
   async closeAndWait() {
     this._progress?.log(`<chrome debugger disconnecting>`);
+    this._closing = true;
     chrome.debugger.onEvent.removeListener(this._onDebuggerEvent);
+    chrome.debugger.onDetach.removeListener(this._onDebuggerDetach);
     chrome.tabs.onCreated.removeListener(this._onPopupCreated);
+    chrome.tabs.onRemoved.removeListener(this._onTabRemoved);
     this.close();
-    await this._detachedPromise; // Make sure to await the actual disconnect.
-    chrome.tabs.onRemoved.removeListener(this._onRemoved);
-    chrome.tabs.onDetached.removeListener(this._onRemoved);
+    await this._closePromise;
     this._progress?.log(`<chrome debugger disconnected>`);
   }
 
@@ -251,17 +269,19 @@ export class CrxTransport implements ConnectionTransport {
       await this.attach(id).catch(() => {});
   };
 
-  private _onRemoved = (tabIdOrDebuggee: number | { tabId?: number }) => {
-    const tabId = typeof tabIdOrDebuggee === 'number' ? tabIdOrDebuggee : tabIdOrDebuggee.tabId;
+  private _onTabRemoved = (tabId: number) => {
     if (!tabId)
       return;
+    this._dropTabMappings(tabId, true);
+  };
 
-    const targetInfo = this._tabToTarget.get(tabId);
-    this._tabToTarget.delete(tabId);
-    if (targetInfo) {
-      this._targetToTab.delete(targetInfo.targetId);
-      this._emitDetachedToTarget(tabId, targetInfo.targetId);
-    }
+  private _onDebuggerDetach = async ({ tabId }: DebuggerSession, reason: string) => {
+    if (!tabId)
+      return;
+    this._dropTabMappings(tabId, true);
+    if (this._closing || reason === 'canceled_by_user')
+      return;
+    await this._reconnect(tabId);
   };
 
   private _onDebuggerEvent = ({ tabId, sessionId }: DebuggerSession, message?: string, params?: any) => {
@@ -328,5 +348,95 @@ export class CrxTransport implements ConnectionTransport {
     return [...this._tabToTarget]
         .filter(([, targetInfo]) => targetInfo.browserContextId === browserContextId)
         .map(([tabId, targetInfo]) => ({ tabId, targetId: targetInfo?.targetId } satisfies chrome.debugger.Debuggee));
+  }
+
+  private _dropTabMappings(tabId: number, emitDetached: boolean) {
+    const targetInfo = this._tabToTarget.get(tabId);
+    this._tabToTarget.delete(tabId);
+    if (!targetInfo)
+      return;
+    this._targetToTab.delete(targetInfo.targetId);
+    if (emitDetached)
+      this._emitDetachedToTarget(tabId, targetInfo.targetId);
+    for (const [sessionId, sessionTabId] of this._sessions) {
+      if (sessionTabId === tabId)
+        this._sessions.delete(sessionId);
+    }
+  }
+
+  private async _resolveDebuggee(message: ProtocolRequest) {
+    const [, tabIdStr] = /crx-tab-(\d+)/.exec(message.sessionId ?? '') ?? [];
+    if (tabIdStr) {
+      const tabId = parseInt(tabIdStr, 10);
+      await this._reconnect(tabId);
+      return { tabId, debuggee: { tabId } satisfies DebuggerSession };
+    }
+    const sessionId = message.sessionId!;
+    const tabId = this._sessions.get(sessionId);
+    if (!tabId)
+      throw new Error(`Session ${sessionId} is no longer attached`);
+    return { tabId, debuggee: { tabId, sessionId } satisfies DebuggerSession };
+  }
+
+  private async _reconnect(tabId: number) {
+    if (this._closing)
+      return;
+    if (this._tabToTarget.has(tabId))
+      return;
+    const pending = this._reconnectPromises.get(tabId);
+    if (pending)
+      return await pending;
+    const promise = (async () => {
+      const retryLimit = 3;
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= retryLimit; attempt++) {
+        try {
+          await this.attach(tabId);
+          return;
+        } catch (error) {
+          lastError = error;
+          if (!this._isRetryableError(error))
+            throw error;
+          await new Promise(resolve => setTimeout(resolve, attempt * 100));
+        }
+      }
+      throw lastError;
+    })().finally(() => this._reconnectPromises.delete(tabId));
+    this._reconnectPromises.set(tabId, promise);
+    return await promise;
+  }
+
+  private async _sendWithRecovery<T extends keyof Protocol.CommandParameters>(
+    tabId: number,
+    debuggee: DebuggerSession,
+    method: T,
+    commandParams?: Protocol.CommandParameters[T]
+  ) {
+    const retryLimit = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= retryLimit; attempt++) {
+      try {
+        return await this._send(debuggee, method, commandParams);
+      } catch (error) {
+        lastError = error;
+        if (this._closing || !this._isRetryableError(error))
+          throw error;
+        this._dropTabMappings(tabId, false);
+        await this._reconnect(tabId);
+        await new Promise(resolve => setTimeout(resolve, attempt * 100));
+      }
+    }
+    throw lastError;
+  }
+
+  private _isRetryableError(error: unknown) {
+    const message = String((error as any)?.message ?? error ?? '').toLowerCase();
+    return [
+      'debugger is not attached',
+      'no tab with given id',
+      'session with given id',
+      'target closed',
+      'inspected target navigated or closed'
+    ].some(token => message.includes(token));
   }
 }

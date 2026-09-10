@@ -211,7 +211,37 @@ test.describe('recorder window regressions', () => {
     closeWindowExternally((popup as any)._window.id);
     await flush();
 
-    expect(hides).toBe(1);
+    await expect.poll(() => hides).toBe(1);
+    expect(popup.isClosed()).toBe(true);
+  });
+
+  test('popup explicit close does not reconnect on disconnect', async () => {
+    const { chromeMock, runtimeOnConnect } = createChromeMock();
+    globalThis.chrome = chromeMock as typeof chrome;
+
+    const popup = new PopupRecorderWindow('index.html');
+    const openPromise = popup.open();
+    const port = createPort();
+    runtimeOnConnect.emit(port);
+    await openPromise;
+
+    await popup.close();
+    port.disconnect();
+    await flush();
+
+    expect(popup.isClosed()).toBe(true);
+    expect(runtimeOnConnect.listenerCount()).toBe(0);
+  });
+
+  test('popup closes and hides when reconnect retries are exhausted', async () => {
+    const { chromeMock } = createChromeMock();
+    globalThis.chrome = chromeMock as typeof chrome;
+
+    const popup = new PopupRecorderWindow('index.html', { connectTimeoutMs: 10, maxConnectAttempts: 2, retryDelayMs: 1 });
+
+    await expect(popup.open()).rejects.toThrow(/popup recorder connection/i);
+    await flush();
+
     expect(popup.isClosed()).toBe(true);
   });
 
@@ -260,5 +290,17 @@ test.describe('recorder window regressions', () => {
 
     expect(events).toHaveLength(2);
     expect(runtimeOnConnect.listenerCount()).toBe(0);
+  });
+
+  test('sidepanel closes and hides when reconnect retries are exhausted', async () => {
+    const { chromeMock } = createChromeMock();
+    globalThis.chrome = chromeMock as typeof chrome;
+
+    const sidepanel = new SidepanelRecorderWindow('index.html', { connectTimeoutMs: 10, maxConnectAttempts: 2, retryDelayMs: 1 });
+
+    await expect(sidepanel.open()).rejects.toThrow(/sidepanel recorder connection/i);
+    await flush();
+
+    expect(sidepanel.isClosed()).toBe(true);
   });
 });
