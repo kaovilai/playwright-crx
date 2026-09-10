@@ -61,6 +61,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
   private _window?: RecorderWindow;
   private _editedCode?: EditedCode;
   private _recordedActions: ActionInContextWithLocation[] = [];
+  private _hasPausedActions = false;
   private _playInIncognito = false;
   private _currentCursorPosition: { line: number } | undefined;
 
@@ -144,6 +145,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
   }
 
   async setSources(sources: Source[]) {
+    this._hasPausedActions = sources.some(source => source.highlight?.some(highlight => highlight.type === 'paused'));
     sources = sources
     // hack to prevent recorder from opening files
         .filter(s => s.isRecorded)
@@ -223,7 +225,8 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
           break;
         case 'resume':
         case 'step':
-          this._run().catch(() => {});
+          if (!this._hasPausedActions)
+            this._run().catch(() => {});
           break;
         case 'setMode':
           const { mode } = params;
