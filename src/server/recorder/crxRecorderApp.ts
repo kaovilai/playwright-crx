@@ -61,7 +61,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
   private _window?: RecorderWindow;
   private _editedCode?: EditedCode;
   private _recordedActions: ActionInContextWithLocation[] = [];
-  private _hasPausedActions = false;
+  private _callLogs = new Map<string, CallLog>();
   private _playInIncognito = false;
   private _currentCursorPosition: { line: number } | undefined;
 
@@ -145,7 +145,6 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
   }
 
   async setSources(sources: Source[]) {
-    this._hasPausedActions = sources.some(source => source.highlight?.some(highlight => highlight.type === 'paused'));
     sources = sources
     // hack to prevent recorder from opening files
         .filter(s => s.isRecorded)
@@ -164,10 +163,13 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
   }
 
   async resetCallLogs() {
+    this._callLogs.clear();
     this._sendMessage({ type: 'recorder', method: 'resetCallLogs' });
   }
 
   async updateCallLogs(callLogs: CallLog[]) {
+    for (const callLog of callLogs)
+      this._callLogs.set(callLog.id, callLog);
     this._sendMessage({ type: 'recorder', method: 'updateCallLogs', callLogs });
   }
 
@@ -225,7 +227,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
           break;
         case 'resume':
         case 'step':
-          if (!this._hasPausedActions)
+          if (![...this._callLogs.values()].some(callLog => callLog.status === 'paused' && callLog.title !== 'Pause'))
             this._run().catch(() => {});
           break;
         case 'setMode':
