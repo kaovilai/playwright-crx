@@ -22,6 +22,7 @@ export class PopupRecorderWindow implements RecorderWindow {
   private _port?: chrome.runtime.Port;
   private _portPromise?: Promise<chrome.runtime.Port>;
   private _connectListener?: (port: chrome.runtime.Port) => void;
+  private _reconnectPending = false;
   private _windowRemovedListener?: (windowId: number) => void;
   private _isClosing = false;
   onMessage?: ({ type, event, params }: RecorderEventData) => void;
@@ -120,13 +121,19 @@ export class PopupRecorderWindow implements RecorderWindow {
 
   private _onDisconnect = () => {
     this._cleanupPort(false);
-    if (this._isClosing || !this._window?.id)
+    this._portPromise = undefined;
+    if (this._isClosing || !this._window?.id || this._reconnectPending || this._connectListener)
       return;
-    chrome.windows.get(this._window.id)
+    const windowId = this._window.id;
+    this._reconnectPending = true;
+    chrome.windows.get(windowId)
         .then(() => {
-          if (!this._isClosing && this._window?.id)
+          if (!this._isClosing && this._window?.id === windowId && !this._connectListener)
             this._portPromise = this._waitForConnect();
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          this._reconnectPending = false;
+        });
   };
 }
