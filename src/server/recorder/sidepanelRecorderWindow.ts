@@ -31,11 +31,14 @@ export class SidepanelRecorderWindow implements RecorderWindow {
     this._connection = new RuntimePortLifecycle<RecorderMessage>({
       name: 'sidepanel recorder connection',
       canReconnect: () => !this._closed,
+      acceptPort: port => port.name === 'recorder',
       getMessageListener: () => this.onMessage,
       onConnected: () => this.onConnected?.(),
       onConnectionExhausted: () => {
         if (!this._closed)
-          this.close().then(() => this.hideApp?.()).catch(() => {});
+          this.close().catch(() => {}).finally(() => this.hideApp?.());
+        else
+          this.hideApp?.();
       },
       ...connectionOptions
     });
@@ -51,10 +54,16 @@ export class SidepanelRecorderWindow implements RecorderWindow {
 
   async open() {
     this._closed = false;
-    await Promise.all([
-      chrome.sidePanel.setOptions({ path: this._recorderUrl }),
-      this._connection.open(),
-    ]);
+    try {
+      await Promise.all([
+        chrome.sidePanel.setOptions({ path: this._recorderUrl }),
+        this._connection.open(),
+      ]);
+    } catch (error) {
+      this._closed = true;
+      await this._connection.close({ disconnect: true });
+      throw error;
+    }
   }
 
   async focus() {

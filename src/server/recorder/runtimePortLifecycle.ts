@@ -17,6 +17,7 @@
 type RuntimePortLifecycleOptions = {
   readonly name: string;
   readonly canReconnect: () => boolean;
+  readonly acceptPort?: (port: chrome.runtime.Port) => boolean;
   readonly getMessageListener: () => ((message: any) => void) | undefined;
   readonly onConnected?: () => void;
   readonly onConnectionExhausted?: (error: Error) => void;
@@ -34,6 +35,7 @@ export class RuntimePortLifecycle<TMessage> {
   private _queuedMessages: TMessage[] = [];
   private _connectingPromise?: Promise<chrome.runtime.Port>;
   private _connectListener?: (port: chrome.runtime.Port) => void;
+  private _boundMessageListener?: (message: any) => void;
 
   constructor(options: RuntimePortLifecycleOptions) {
     this._options = options;
@@ -116,6 +118,8 @@ export class RuntimePortLifecycle<TMessage> {
         }
       };
       this._connectListener = port => {
+        if (this._options.acceptPort && !this._options.acceptPort(port))
+          return;
         cleanup();
         this._bindPort(port);
         this._options.onConnected?.();
@@ -128,9 +132,9 @@ export class RuntimePortLifecycle<TMessage> {
   private _bindPort(port: chrome.runtime.Port) {
     this._cleanupPort(false);
     this._port = port;
-    const messageListener = this._options.getMessageListener();
-    if (messageListener)
-      port.onMessage.addListener(messageListener);
+    this._boundMessageListener = this._options.getMessageListener();
+    if (this._boundMessageListener)
+      port.onMessage.addListener(this._boundMessageListener);
     port.onDisconnect.addListener(this._onDisconnect);
     this._flushQueue();
   }
@@ -158,9 +162,9 @@ export class RuntimePortLifecycle<TMessage> {
     if (!this._port)
       return;
     this._port.onDisconnect.removeListener(this._onDisconnect);
-    const messageListener = this._options.getMessageListener();
-    if (messageListener)
-      this._port.onMessage.removeListener(messageListener);
+    if (this._boundMessageListener)
+      this._port.onMessage.removeListener(this._boundMessageListener);
+    this._boundMessageListener = undefined;
     if (disconnect)
       this._port.disconnect();
     this._port = undefined;

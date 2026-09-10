@@ -204,4 +204,66 @@ test.describe('transport reconnect', () => {
     expect(detachCalls).toBeGreaterThanOrEqual(1);
     expect(debuggerOnDetach.listenerCount()).toBe(0);
   });
+
+  test('stale child sessions are renewed after reconnect', async () => {
+    const debuggerOnEvent = new MockEvent<(debuggee: any, method: string, params: any) => void>();
+    const debuggerOnDetach = new MockEvent<(debuggee: any, reason: string) => void>();
+    const tabsOnRemoved = new MockEvent<(tabId: number) => void>();
+    const tabsOnCreated = new MockEvent<(tab: chrome.tabs.Tab) => void>();
+    let attachCalls = 0;
+    let attachToTargetCalls = 0;
+
+    globalThis.chrome = {
+      debugger: {
+        onEvent: debuggerOnEvent,
+        onDetach: debuggerOnDetach,
+        async attach() {
+          attachCalls++;
+        },
+        async detach() {},
+        async sendCommand(debuggee: any, method: string, params: any) {
+          if (method === 'Target.getTargetInfo') {
+            return {
+              targetInfo: {
+                targetId: `target-${attachCalls}`,
+                browserContextId: 'context-1',
+              }
+            };
+          }
+          if (method === 'Target.attachToTarget') {
+            attachToTargetCalls++;
+            expect(params.targetId).toBe('child-target');
+            return { sessionId: 'child-2' };
+          }
+          if (method === 'Runtime.evaluate') {
+            expect(debuggee.sessionId).toBe('child-2');
+            return { result: { type: 'number', value: 7 } };
+          }
+          return {};
+        }
+      },
+      tabs: {
+        onRemoved: tabsOnRemoved,
+        onCreated: tabsOnCreated,
+        async get() {
+          return { incognito: false };
+        },
+      },
+    } as unknown as typeof chrome;
+
+    const transport = new CrxTransport();
+    const messages: any[] = [];
+    transport.onmessage = message => messages.push(message);
+
+    await transport.attach(1);
+    debuggerOnEvent.emit({ tabId: 1 }, 'Target.attachedToTarget', { sessionId: 'child-1', targetInfo: { targetId: 'child-target' } });
+    debuggerOnDetach.emit({ tabId: 1 }, 'target_closed');
+    await flush();
+    await flush();
+
+    await transport.send({ id: 8, method: 'Runtime.evaluate', params: { expression: '3+4' }, sessionId: 'child-1' } as any);
+    expect(attachCalls).toBe(2);
+    expect(attachToTargetCalls).toBe(1);
+    expect(messages[messages.length - 1].result?.result?.value).toBe(7);
+  });
 });

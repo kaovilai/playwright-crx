@@ -14,19 +14,12 @@
  * limitations under the License.
  */
 
+import type { LogName } from 'playwright-core/lib/server/utils/debugLogger';
+import { debugLogger } from 'playwright-core/lib/server/utils/debugLogger';
 import type { Protocol } from 'playwright-core/lib/server/chromium/protocol';
 import type { Progress } from 'playwright-core/lib/server/progress';
 import type { ConnectionTransport, ProtocolRequest, ProtocolResponse } from 'playwright-core/lib/server/transport';
 import { createTab } from '../utils';
-
-type LogName = string;
-const debugLogger = (() => {
-  try {
-    return require('playwright-core/lib/server/utils/debugLogger').debugLogger;
-  } catch {
-    return { isEnabled: () => false, log: () => {} };
-  }
-})();
 
 type Tab = chrome.tabs.Tab;
 
@@ -41,9 +34,17 @@ export class CrxTransport implements ConnectionTransport {
   private _targetToTab: Map<string, number>;
   private _tabToTarget: Map<number, Protocol.Target.TargetInfo>;
   private _sessions: Map<string, number>;
+  private _sessionTargets: Map<string, string>;
+  private _sessionTargetInfos: Map<string, Protocol.Target.TargetInfo>;
+  private _staleSessions: Map<string, number>;
+  private _staleSessionTargets: Map<string, string>;
+  private _staleSessionTargetInfos: Map<string, Protocol.Target.TargetInfo>;
+  private _sessionAliases: Map<string, string>;
+  private _sessionRecoveryPromises: Map<string, Promise<{ tabId: number, sessionId: string }>>;
   private _attachPromises: Map<number, Promise<Protocol.Target.TargetInfo>>;
   private _detachPromises: Map<number, Promise<void>>;
   private _reconnectPromises: Map<number, Promise<void>>;
+  private _detachingTabs: Set<number>;
   private _defaultBrowserContextId?: string;
 
   onmessage?: (message: ProtocolResponse) => void;
@@ -54,9 +55,17 @@ export class CrxTransport implements ConnectionTransport {
     this._tabToTarget = new Map();
     this._targetToTab = new Map();
     this._sessions = new Map();
+    this._sessionTargets = new Map();
+    this._sessionTargetInfos = new Map();
+    this._staleSessions = new Map();
+    this._staleSessionTargets = new Map();
+    this._staleSessionTargetInfos = new Map();
+    this._sessionAliases = new Map();
+    this._sessionRecoveryPromises = new Map();
     this._attachPromises = new Map();
     this._detachPromises = new Map();
     this._reconnectPromises = new Map();
+    this._detachingTabs = new Set();
     chrome.debugger.onEvent.addListener(this._onDebuggerEvent);
     chrome.debugger.onDetach.addListener(this._onDebuggerDetach);
     chrome.tabs.onRemoved.addListener(this._onTabRemoved);
@@ -158,7 +167,7 @@ export class CrxTransport implements ConnectionTransport {
         await Promise.all(debuggees.map(debuggee => this._send(debuggee, 'Network.setCookies', params)));
         result = {};
       } else {
-        result = await this._sendWithRecovery(tabId, debuggee, message.method as keyof Protocol.CommandParameters, { ...message.params });
+        result = await this._sendWithRecovery(tabId, debuggee, message.method as keyof Protocol.CommandParameters, { ...message.params }, message.sessionId);
       }
 
       this._emitMessage({
@@ -218,9 +227,14 @@ export class CrxTransport implements ConnectionTransport {
       return await pending;
 
     const promise = (async () => {
-      this._dropTabMappings(tabId, true);
-      await chrome.debugger.detach({ tabId }).catch(() => {});
-      this._progress?.log(`<chrome debugger detached from tab ${tabId}>`);
+      this._detachingTabs.add(tabId);
+      try {
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        this._dropTabMappings(tabId, true);
+        this._progress?.log(`<chrome debugger detached from tab ${tabId}>`);
+      } finally {
+        this._detachingTabs.delete(tabId);
+      }
     })().finally(() => this._detachPromises.delete(tabId));
     this._detachPromises.set(tabId, promise);
     return await promise;
@@ -238,12 +252,12 @@ export class CrxTransport implements ConnectionTransport {
   async closeAndWait() {
     this._progress?.log(`<chrome debugger disconnecting>`);
     this._closing = true;
+    this.close();
+    await this._closePromise;
     chrome.debugger.onEvent.removeListener(this._onDebuggerEvent);
     chrome.debugger.onDetach.removeListener(this._onDebuggerDetach);
     chrome.tabs.onCreated.removeListener(this._onPopupCreated);
     chrome.tabs.onRemoved.removeListener(this._onTabRemoved);
-    this.close();
-    await this._closePromise;
     this._progress?.log(`<chrome debugger disconnected>`);
   }
 
@@ -278,10 +292,28 @@ export class CrxTransport implements ConnectionTransport {
   private _onDebuggerDetach = async ({ tabId }: DebuggerSession, reason: string) => {
     if (!tabId)
       return;
-    this._dropTabMappings(tabId, true);
-    if (this._closing || reason === 'canceled_by_user')
+    if (this._detachingTabs.has(tabId)) {
+      this._dropTabMappings(tabId, true);
       return;
-    await this._reconnect(tabId);
+    }
+    if (reason === 'canceled_by_user' || reason === 'replaced_with_devtools') {
+      this._dropTabMappings(tabId, true);
+      return;
+    }
+    const transient = this._isTransientDetachReason(reason);
+    const detachedTargetId = this._dropTabMappings(tabId, !transient);
+    if (this._closing || !transient)
+      return;
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    if (!tab) {
+      if (detachedTargetId)
+        this._emitDetachedToTarget(tabId, detachedTargetId);
+      return;
+    }
+    await this._reconnect(tabId).catch(() => {
+      if (detachedTargetId)
+        this._emitDetachedToTarget(tabId, detachedTargetId);
+    });
   };
 
   private _onDebuggerEvent = ({ tabId, sessionId }: DebuggerSession, message?: string, params?: any) => {
@@ -290,10 +322,28 @@ export class CrxTransport implements ConnectionTransport {
     if (!sessionId)
       sessionId = this._sessionIdFor(tabId);
 
-    if (message === 'Target.attachedToTarget')
-      this._sessions.set((params as Protocol.Target.attachToTargetReturnValue).sessionId, tabId);
-    else if (message === 'Target.detachedFromTarget')
-      this._sessions.delete((params as Protocol.Target.attachToTargetReturnValue).sessionId);
+    if (message === 'Target.attachedToTarget') {
+      const { sessionId: attachedSessionId, targetInfo } = params as Protocol.Target.attachedToTargetPayload;
+      this._sessions.set(attachedSessionId, tabId);
+      if (targetInfo?.targetId)
+        this._sessionTargets.set(attachedSessionId, targetInfo.targetId);
+      if (targetInfo)
+        this._sessionTargetInfos.set(attachedSessionId, targetInfo);
+      this._sessionAliases.delete(attachedSessionId);
+    } else if (message === 'Target.detachedFromTarget') {
+      const { sessionId: detachedSessionId } = params as Protocol.Target.detachedFromTargetPayload;
+      const targetId = this._sessionTargets.get(detachedSessionId);
+      if (targetId)
+        this._staleSessionTargets.set(detachedSessionId, targetId);
+      const targetInfo = this._sessionTargetInfos.get(detachedSessionId);
+      if (targetInfo)
+        this._staleSessionTargetInfos.set(detachedSessionId, targetInfo);
+      this._staleSessions.set(detachedSessionId, tabId);
+      this._sessions.delete(detachedSessionId);
+      this._sessionTargets.delete(detachedSessionId);
+      this._sessionTargetInfos.delete(detachedSessionId);
+      this._cleanupAliasesForSession(detachedSessionId);
+    }
 
 
     if (debugLogger.isEnabled(`chromedebugger` as LogName))
@@ -359,9 +409,21 @@ export class CrxTransport implements ConnectionTransport {
     if (emitDetached)
       this._emitDetachedToTarget(tabId, targetInfo.targetId);
     for (const [sessionId, sessionTabId] of this._sessions) {
-      if (sessionTabId === tabId)
+      if (sessionTabId === tabId) {
+        this._staleSessions.set(sessionId, tabId);
+        const targetId = this._sessionTargets.get(sessionId);
+        if (targetId)
+          this._staleSessionTargets.set(sessionId, targetId);
+        const targetInfo = this._sessionTargetInfos.get(sessionId);
+        if (targetInfo)
+          this._staleSessionTargetInfos.set(sessionId, targetInfo);
         this._sessions.delete(sessionId);
+        this._sessionTargets.delete(sessionId);
+        this._sessionTargetInfos.delete(sessionId);
+        this._cleanupAliasesForSession(sessionId);
+      }
     }
+    return targetInfo.targetId;
   }
 
   private async _resolveDebuggee(message: ProtocolRequest) {
@@ -371,11 +433,64 @@ export class CrxTransport implements ConnectionTransport {
       await this._reconnect(tabId);
       return { tabId, debuggee: { tabId } satisfies DebuggerSession };
     }
-    const sessionId = message.sessionId!;
+    const originalSessionId = message.sessionId!;
+    const sessionId = this._sessionAliases.get(originalSessionId) ?? originalSessionId;
     const tabId = this._sessions.get(sessionId);
-    if (!tabId)
-      throw new Error(`Session ${sessionId} is no longer attached`);
-    return { tabId, debuggee: { tabId, sessionId } satisfies DebuggerSession };
+    if (tabId)
+      return { tabId, debuggee: { tabId, sessionId } satisfies DebuggerSession };
+
+    const staleTabId = this._staleSessions.get(originalSessionId);
+    const targetId = this._sessionTargets.get(originalSessionId) ?? this._staleSessionTargets.get(originalSessionId);
+    const targetInfo = this._sessionTargetInfos.get(originalSessionId) ?? this._staleSessionTargetInfos.get(originalSessionId);
+    if (staleTabId === undefined || !targetId)
+      throw new Error(`Session ${originalSessionId} is no longer attached`);
+
+    const pendingRecovery = this._sessionRecoveryPromises.get(originalSessionId);
+    if (pendingRecovery) {
+      const recovered = await pendingRecovery;
+      return { tabId: recovered.tabId, debuggee: recovered satisfies DebuggerSession };
+    }
+
+    const recovery = (async () => {
+      await this._reconnect(staleTabId);
+      const { sessionId: renewedSessionId } = await this._sendWithRecovery(staleTabId, { tabId: staleTabId }, 'Target.attachToTarget', { targetId, flatten: true });
+      const wasKnownSession = this._sessions.has(renewedSessionId);
+      const previousSessionId = this._sessionAliases.get(originalSessionId);
+      if (previousSessionId && previousSessionId !== renewedSessionId && previousSessionId !== originalSessionId) {
+        this._sessions.delete(previousSessionId);
+        this._sessionTargets.delete(previousSessionId);
+        this._sessionTargetInfos.delete(previousSessionId);
+        this._clearStaleSession(previousSessionId);
+        for (const [sourceSessionId, targetSessionId] of this._sessionAliases) {
+          if (targetSessionId === previousSessionId) {
+            this._sessionAliases.set(sourceSessionId, renewedSessionId);
+            this._clearStaleSession(sourceSessionId);
+          }
+        }
+        this._sessionAliases.delete(previousSessionId);
+      }
+      this._sessions.set(renewedSessionId, staleTabId);
+      this._sessionTargets.set(renewedSessionId, targetId);
+      if (targetInfo)
+        this._sessionTargetInfos.set(renewedSessionId, targetInfo);
+      this._sessionAliases.set(originalSessionId, renewedSessionId);
+      this._clearStaleSession(originalSessionId);
+      this._clearStaleSession(renewedSessionId);
+      if (!wasKnownSession && targetInfo) {
+        this._emitMessage({
+          method: 'Target.attachedToTarget',
+          sessionId: '',
+          params: {
+            sessionId: renewedSessionId,
+            targetInfo,
+          } satisfies Protocol.Target.attachedToTargetPayload
+        });
+      }
+      return { tabId: staleTabId, sessionId: renewedSessionId };
+    })().finally(() => this._sessionRecoveryPromises.delete(originalSessionId));
+    this._sessionRecoveryPromises.set(originalSessionId, recovery);
+    const recovered = await recovery;
+    return { tabId: recovered.tabId, debuggee: recovered satisfies DebuggerSession };
   }
 
   private async _reconnect(tabId: number) {
@@ -410,19 +525,27 @@ export class CrxTransport implements ConnectionTransport {
     tabId: number,
     debuggee: DebuggerSession,
     method: T,
-    commandParams?: Protocol.CommandParameters[T]
+    commandParams?: Protocol.CommandParameters[T],
+    sessionIdForRetry?: string
   ) {
     const retryLimit = 3;
     let lastError: unknown;
+    let currentTabId = tabId;
+    let currentDebuggee = debuggee;
     for (let attempt = 1; attempt <= retryLimit; attempt++) {
       try {
-        return await this._send(debuggee, method, commandParams);
+        return await this._send(currentDebuggee, method, commandParams);
       } catch (error) {
         lastError = error;
         if (this._closing || !this._isRetryableError(error))
           throw error;
-        this._dropTabMappings(tabId, false);
-        await this._reconnect(tabId);
+        this._dropTabMappings(currentTabId, false);
+        await this._reconnect(currentTabId);
+        if (sessionIdForRetry && !/crx-tab-\d+/.test(sessionIdForRetry)) {
+          const renewed = await this._resolveDebuggee({ sessionId: sessionIdForRetry } as ProtocolRequest);
+          currentTabId = renewed.tabId;
+          currentDebuggee = renewed.debuggee;
+        }
         await new Promise(resolve => setTimeout(resolve, attempt * 100));
       }
     }
@@ -438,5 +561,23 @@ export class CrxTransport implements ConnectionTransport {
       'target closed',
       'inspected target navigated or closed'
     ].some(token => message.includes(token));
+  }
+
+  private _isTransientDetachReason(reason: string) {
+    return ['target_closed', 'connection_closed'].includes(reason);
+  }
+
+  private _cleanupAliasesForSession(sessionId: string) {
+    this._sessionAliases.delete(sessionId);
+    for (const [sourceSessionId, targetSessionId] of this._sessionAliases) {
+      if (targetSessionId === sessionId)
+        this._sessionAliases.delete(sourceSessionId);
+    }
+  }
+
+  private _clearStaleSession(sessionId: string) {
+    this._staleSessions.delete(sessionId);
+    this._staleSessionTargets.delete(sessionId);
+    this._staleSessionTargetInfos.delete(sessionId);
   }
 }

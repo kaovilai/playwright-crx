@@ -34,6 +34,7 @@ export class PopupRecorderWindow implements RecorderWindow {
     this._connection = new RuntimePortLifecycle<RecorderMessage>({
       name: 'popup recorder connection',
       canReconnect: () => !this._isClosing && (this._opening || !!this._window?.id),
+      acceptPort: port => port.name === 'recorder',
       getMessageListener: () => this.onMessage,
       onConnected: () => this.onConnected?.(),
       onConnectionExhausted: () => {
@@ -72,6 +73,7 @@ export class PopupRecorderWindow implements RecorderWindow {
       ]);
       this._window = wnd;
     } catch (error) {
+      this._opening = false;
       await this.close();
       throw error;
     } finally {
