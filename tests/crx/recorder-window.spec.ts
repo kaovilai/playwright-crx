@@ -91,6 +91,11 @@ function createChromeMock() {
         activeWindowIds.add(wnd.id);
         return wnd;
       },
+      async get(id: number) {
+        if (!activeWindowIds.has(id))
+          throw new Error(`Window ${id} not found`);
+        return { id };
+      },
       async update(id: number, options: { drawAttention?: boolean, focused?: boolean }) {
         updatedWindows.push({ id, options });
       },

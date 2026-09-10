@@ -65,6 +65,7 @@ export type CallLogStatus = 'in-progress' | 'done' | 'error' | 'paused';
 
 export type CallLog = {
   id: string;
+  internal?: boolean;
   title: string;
   messages: string[];
   status: CallLogStatus;

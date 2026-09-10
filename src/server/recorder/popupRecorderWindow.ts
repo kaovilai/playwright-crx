@@ -120,7 +120,13 @@ export class PopupRecorderWindow implements RecorderWindow {
 
   private _onDisconnect = () => {
     this._cleanupPort(false);
-    if (!this._isClosing)
-      this._portPromise = this._waitForConnect();
+    if (this._isClosing || !this._window?.id)
+      return;
+    chrome.windows.get(this._window.id)
+        .then(() => {
+          if (!this._isClosing && this._window?.id)
+            this._portPromise = this._waitForConnect();
+        })
+        .catch(() => {});
   };
 }

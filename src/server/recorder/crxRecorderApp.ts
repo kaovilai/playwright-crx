@@ -227,7 +227,7 @@ export class CrxRecorderApp extends EventEmitter implements IRecorderApp {
           break;
         case 'resume':
         case 'step':
-          if (![...this._callLogs.values()].some(callLog => callLog.status === 'paused' && callLog.title !== 'Pause'))
+          if (![...this._callLogs.values()].some(callLog => callLog.status === 'paused' && !callLog.internal))
             this._run().catch(() => {});
           break;
         case 'setMode':
